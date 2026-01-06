@@ -11,7 +11,7 @@ from datetime import date, timedelta, datetime
 
 # ----------------- Output location (one constant) --------------------
 # Change this to wherever yo/home/erling/garmin-output"
-OUTPUT_DIR = pathlib.Path(r"/home/erling/garmin_output").resolve()  # <-- edit if needed
+OUTPUT_DIR = pathlib.Path(r"./garmin_output").resolve()  # <-- edit if needed
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_PATH = OUTPUT_DIR / "weight_log.txt"

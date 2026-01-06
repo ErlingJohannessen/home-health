@@ -17,8 +17,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = OUTPUT_DIR / "weight_log.txt"
 
 # ------------- Logging of all stdout/stderr to a file ---------------
-# open in append mode, line-buffered; capture both stdout & stderr
-sys.stdout = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
+# open in write mode, line-buffered; capture both stdout & stderr
+sys.stdout = open(LOG_PATH, "w", buffering=1, encoding="utf-8")
 sys.stderr = sys.stdout
 print(f"\n=== Run started {datetime.now().isoformat()} ===")
 print(f"Output directory: {OUTPUT_DIR}")

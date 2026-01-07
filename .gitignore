@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Logs
+logs/
+*.log
+
+# Environment/config files (keep example templates in Git)
+config/myapp.env
+*.env
+
+# Lock files (optional)
+run_myapp.lock
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE/project files
+.vscode/
+.idea/
+*.swp

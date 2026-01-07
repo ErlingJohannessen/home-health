@@ -1,4 +1,4 @@
-# fetch_weight_standalone.py
+# run_weight.py
 # Standalone, non-interactive- HARD-CODED credentials (keep this file private!)
 #  - OUTPUT_DIR controls where files are written
 #  - All printouts captured in OUTPUT_DIR/weight_log.txt

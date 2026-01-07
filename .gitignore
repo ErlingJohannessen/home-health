@@ -26,8 +26,11 @@ Thumbs.db
 .idea/
 *.swp
 
-# Figue files
+# Figure files
 *.jpg
 
 # Output files
-weight/garmin_output/*
+weight_log.txt
+
+# Lock files
+*.lock

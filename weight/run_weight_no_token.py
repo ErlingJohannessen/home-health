@@ -1,131 +1,53 @@
 # run_weight.py
-# Non-interactive; robust token handling for garminconnect+garth.
-# Flow:
-#   1) Try token login via client.login(tokenstore=TOKEN_DIR).
-#   2) If tokens missing/invalid: password login → garth.login(email,pass) → garth.save(TOKEN_DIR).
-#   3) Verify tokens; next run uses token login and skips password.
-# Logs to OUTPUT_DIR/weight_log.txt; saves figures as JPGs.
+# Standalone, non-interactive- HARD-CODED credentials (keep this file private!)
+#  - OUTPUT_DIR controls where files are written
+#  - All printouts captured in OUTPUT_DIR/weight_log.txt
+#  - No GUI popups; figures are saved as JPG then program exits
 # --------------------------------------------------------------------
-import os
 import sys
-import json
 import pathlib
 import traceback
 from datetime import date, timedelta, datetime
 
-# ----------------- Output location --------------------
-OUTPUT_DIR = pathlib.Path("./garmin_output").resolve()
+# ----------------- Output location (one constant) --------------------
+# Change this to wherever yo/home/erling/garmin-output"
+OUTPUT_DIR = pathlib.Path(r"./garmin_output").resolve()  # <-- edit if needed
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_PATH = OUTPUT_DIR / "weight_log.txt"
 
-# Token store directory (used by garth & garminconnect)
-TOKEN_DIR = OUTPUT_DIR / "garmin_token"
-TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-
-OAUTH1 = TOKEN_DIR / "oauth1_token.json"
-OAUTH2 = TOKEN_DIR / "oauth2_token.json"
-
-# ------------- Logging -------------------------------
+# ------------- Logging of all stdout/stderr to a file ---------------
+# open in write mode, line-buffered; capture both stdout & stderr
 sys.stdout = open(LOG_PATH, "w", buffering=1, encoding="utf-8")
 sys.stderr = sys.stdout
 print(f"\n=== Run started {datetime.now().isoformat()} ===")
 print(f"Output directory: {OUTPUT_DIR}")
-print(f"Token store dir: {TOKEN_DIR}")
 
-# ----------------- Matplotlib -------------------------
+
+# ----------------- Matplotlib non-interactive backend ----------------
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # must be set before importing pyplot
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 
-# ----------------- Garmin client ----------------------
+# ----------------- Garmin client & credentials -----------------------
 from garminconnect import Garmin
 
-EMAIL = os.environ.get("GARMIN_EMAIL", "eaajohannessen@gmail.com")
-PASSWORD = os.environ.get("GARMIN_PASSWORD", "Erlinga_22")
+# Replace with your actual Garmin credentials
+EMAIL = "eaajohannessen@gmail.com"
+PASSWORD = "Erlinga_22"
 
 def iso(d): return d.isoformat()
 
-# ----------------- Token helpers ----------------------
-def _json_ok(path: pathlib.Path) -> bool:
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return False
-        with open(path, "r", encoding="utf-8") as f:
-            json.load(f)
-        return True
-    except Exception:
-        return False
-
-def tokens_present_and_valid() -> bool:
-    ok1 = _json_ok(OAUTH1)
-    ok2 = _json_ok(OAUTH2) if OAUTH2.exists() else True  # oauth2 optional in some flows
-    if not ok1:
-        print("Token check: oauth1_token.json missing/invalid.")
-    if OAUTH2.exists() and not ok2:
-        print("Token check: oauth2_token.json present but invalid.")
-    return ok1 and ok2
-
-def seed_tokens_via_garth(email: str, password: str) -> bool:
-    """
-    Perform OAuth1 login via garth and save tokens to TOKEN_DIR.
-    Returns True if tokens were written and parseable.
-    """
-    try:
-        import garth
-        print("Seeding tokens via garth.login(...)")
-        # garth >= 0.6.x supports a simple login(email, password)
-        garth.login(email, password)
-        garth.save(str(TOKEN_DIR))
-    except AttributeError:
-        # Older garth might expose a different API; fail gracefully
-        print("garth.login not available on this version.")
-        return False
-    except Exception as e:
-        print(f"garth.login/save failed: {e}")
-        return False
-
-    # Verify non-empty JSON now exists
-    ok = tokens_present_and_valid()
-    if ok:
-        print("Token seed: OK (garth wrote valid JSON).")
-    else:
-        print("Token seed: FAILED (files still empty/invalid).")
-    return ok
-
-# ----------------- Login flow -------------------------
-def login_token_first_then_seed_if_needed():
-    client = Garmin(EMAIL, PASSWORD)
-
-    # 1) Token login first (fast path)
-    if tokens_present_and_valid():
-        try:
-            client.login(tokenstore=str(TOKEN_DIR))
-            print("Token login: OK")
-            return client
-        except Exception as e:
-            print(f"Token login failed ({e}); will try password + seed.")
-
-    # 2) Password login (so the run succeeds regardless)
-    try:
-        client.login()
-        print("Password login: OK")
-    except Exception as e:
-        print(f"Password login failed: {e}")
-        traceback.print_exc()
-        return None
-
-    # 3) Seed tokens via garth (OAuth1) → save → verify
-    seeded = seed_tokens_via_garth(EMAIL, PASSWORD)
-    if not seeded:
-        print("Warning: could not seed tokens; script will rely on password next run.")
-    return client
-
-# ------------------------------ main --------------------------------
 def main():
-    client = login_token_first_then_seed_if_needed()
-    if client is None:
+    # ---------------------- Login (no prompts) -----------------------
+    client = Garmin(EMAIL, PASSWORD)
+    try:
+        client.login()  # non-interactive; will fail if 2FA prompts are enforced
+        print("Login: OK")
+    except Exception as e:
+        print(f"Login failed: {e}")
+        traceback.print_exc()
         return 1
 
     # ---------------------- Date range -------------------------------
@@ -177,15 +99,18 @@ def main():
         return None
 
     def extract_weight_kg(rec: dict):
+        # Weight keys differ across forks
         w = rec.get("weight")
         if w is None:
             w = rec.get("weightInKilograms") or rec.get("weightInKg")
         if w is None:
             return None
+        # Convert grams -> kg if values look like grams
         if isinstance(w, (int, float)) and w > 250:
             return float(w) / 1000.0
         return float(w)
 
+    # Build dict by date to avoid duplicates (last measurement per day wins)
     by_date = {}
     for r in weight_rows:
         ts = r.get("calendarDate") or r.get("date") or r.get("measurementTime")
@@ -198,11 +123,13 @@ def main():
             continue
         by_date[day] = w_kg
 
+    # Actual measurement points (sorted)
     meas_dates = sorted(by_date.keys())
     meas_weights = [by_date[d] for d in meas_dates]
 
     if not meas_dates:
         print("No weight records found in the selected range.")
+        client.session = None
         print("=== Run finished (no data) ===")
         return 0
 
@@ -245,12 +172,12 @@ def main():
     # ---------------------- Centered change per week ------------------
     def centered_change_per_week(weights, prev_len, next_len):
         change = [None] * len(weights)
-        delta_days = (prev_len + next_len + 2) / 2.0
-        scale = 7.0 / delta_days
+        delta_days = (prev_len + next_len + 2) / 2.0  # distance between window centers in days
+        scale = 7.0 / delta_days                      # kg per Δdays -> kg/week
         for i in range(len(weights)):
             if i >= prev_len and i + next_len < len(weights):
-                prev = weights[i - prev_len:i]
-                foll = weights[i + 1:i + 1 + next_len]
+                prev = weights[i - prev_len:i]          # t-N_prev .. t-1
+                foll = weights[i + 1:i + 1 + next_len]  # t+1 .. t+N_next
                 if all(v is not None for v in prev + foll):
                     diff = (sum(foll) / next_len) - (sum(prev) / prev_len)
                     change[i] = diff * scale
@@ -273,6 +200,7 @@ def main():
     weights_3m = daily_weights[start_3m_idx:]
     change_week_3m_per_week = change_week_per_week[start_3m_idx:]
 
+    # Measurement samples within last 3 months (for solid-circle markers)
     meas_dates_3m = [d for d in meas_dates if d >= cutoff]
     meas_weights_3m = [by_date[d] for d in meas_dates_3m]
 
@@ -302,6 +230,7 @@ def main():
     ax1.legend(lines + lines2, labels + labels2, loc="upper left")
     fig1.tight_layout()
 
+    # Save JPG to OUTPUT_DIR with good quality
     out1 = OUTPUT_DIR / "garmin_weight_full_centered_30day_change_per_week.jpg"
     fig1.savefig(out1, dpi=150, format="jpg",
                  pil_kwargs={"quality": 95, "optimize": True})
@@ -347,6 +276,8 @@ def main():
     plt.close(fig2)
     print(f"Saved: {out2}")
 
+    # ---------------------- Logout / cleanup -------------------------
+    client.session = None  # clears the session object
     print("=== Run finished OK ===")
     return 0
 
@@ -364,4 +295,5 @@ if __name__ == "__main__":
             sys.stdout.close()
         except Exception:
             pass
+    # Explicit exit code for schedulers/cron
     sys.exit(exit_code)

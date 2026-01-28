@@ -34,3 +34,5 @@ weight_log.txt
 
 # Lock files
 *.lock
+
+auth_cookies.json

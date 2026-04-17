@@ -1,17 +1,27 @@
-# run_weight.py
-# Non-interactive; robust token handling for garminconnect+garth.
-# Flow:
-#   1) Try token login via client.login(tokenstore=TOKEN_DIR).
-#   2) If tokens missing/invalid: password login → garth.login(email,pass) → garth.save(TOKEN_DIR).
-#   3) Verify tokens; next run uses token login and skips password.
-# Logs to OUTPUT_DIR/weight_log.txt; saves figures as JPGs.
-# --------------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+run_weight.py
+Non-interactive; robust token handling for garminconnect + garth (via garminconnect).
+
+Key behavior:
+  - Use tokenstore for login so tokens are re-used and refreshed automatically.
+  - If token refresh fails with 401 Unauthorized, clear tokenstore and retry once.
+  - If rate-limited (429 Too Many Requests), fail fast to avoid hammering Garmin.
+  - Do NOT hardcode credentials; use env vars:
+        GARMIN_EMAIL, GARMIN_PASSWORD
+  - Logs to OUTPUT_DIR/weight_log.txt and saves a weight plot as JPG.
+
+Working directory:
+  - Script expects to run from the directory that contains ./garmin_output (your run_weight.sh cd's to it). [1](https://masterx-my.sharepoint.com/personal/erling_johannessen_km_kongsberg_com/Documents/Microsoft%20Copilot%20Chat%20Files/run_weight.py)
+"""
+
 import os
 import sys
 import json
+import shutil
 import pathlib
 import traceback
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 
 # ----------------- Output location --------------------
 OUTPUT_DIR = pathlib.Path("./garmin_output").resolve()
@@ -19,21 +29,26 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_PATH = OUTPUT_DIR / "weight_log.txt"
 
-# Token store directory (used by garth & garminconnect)
+# Token store directory (used by garminconnect/garth)
 TOKEN_DIR = OUTPUT_DIR / "garmin_token"
 TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
+# Optional: files that may exist in token dir (we don't strictly depend on them)
 OAUTH1 = TOKEN_DIR / "oauth1_token.json"
 OAUTH2 = TOKEN_DIR / "oauth2_token.json"
 
-# ------------- Logging -------------------------------
+COOLDOWN_FILE = OUTPUT_DIR / "last_429.txt"
+COOLDOWN_HOURS = 6
+
+# ----------------- Logging ----------------------------
 sys.stdout = open(LOG_PATH, "w", buffering=1, encoding="utf-8")
 sys.stderr = sys.stdout
+
 print(f"\n=== Run started {datetime.now().isoformat()} ===")
 print(f"Output directory: {OUTPUT_DIR}")
 print(f"Token store dir: {TOKEN_DIR}")
 
-# ----------------- Matplotlib -------------------------
+# ----------------- Matplotlib (headless) --------------
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -42,313 +57,300 @@ from matplotlib.dates import DateFormatter
 # ----------------- Garmin client ----------------------
 from garminconnect import Garmin
 
-EMAIL = os.environ.get("GARMIN_EMAIL", "eaajohannessen@gmail.com")
-PASSWORD = os.environ.get("GARMIN_PASSWORD", "Erlinga_22")
 
-def iso(d): return d.isoformat()
+def iso(d: date) -> str:
+    return d.isoformat()
 
-# ----------------- Token helpers ----------------------
-def _json_ok(path: pathlib.Path) -> bool:
+
+def _clear_token_dir() -> None:
+    """Remove tokenstore directory contents to force a clean login next time."""
     try:
-        if not path.exists() or path.stat().st_size == 0:
-            return False
-        with open(path, "r", encoding="utf-8") as f:
-            json.load(f)
-        return True
+        if TOKEN_DIR.exists():
+            shutil.rmtree(TOKEN_DIR)
+        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        print("Cleared token directory.")
+    except Exception as e:
+        print(f"Could not clear token directory: {e}")
+
+def in_cooldown():
+    if not COOLDOWN_FILE.exists():
+        return False
+    try:
+        ts = datetime.fromisoformat(COOLDOWN_FILE.read_text().strip())
+        return datetime.utcnow() < ts + timedelta(hours=COOLDOWN_HOURS)
     except Exception:
         return False
 
-def tokens_present_and_valid() -> bool:
-    ok1 = _json_ok(OAUTH1)
-    ok2 = _json_ok(OAUTH2) if OAUTH2.exists() else True  # oauth2 optional in some flows
-    if not ok1:
-        print("Token check: oauth1_token.json missing/invalid.")
-    if OAUTH2.exists() and not ok2:
-        print("Token check: oauth2_token.json present but invalid.")
-    return ok1 and ok2
+def mark_429():
+    COOLDOWN_FILE.write_text(datetime.utcnow().isoformat())
 
-def seed_tokens_via_garth(email: str, password: str) -> bool:
+def login_tokenstore_or_password_seed(email, password):
     """
-    Perform OAuth1 login via garth and save tokens to TOKEN_DIR.
-    Returns True if tokens were written and parseable.
+    Works with garminconnect 0.2.38 behavior:
+      - If oauth1_token.json exists: load/refresh via tokenstore
+      - If missing: do password login once, then save tokens to tokenstore
+      - If 401: clear tokenstore and retry once
+      - If 429: fail fast (avoid hammering Garmin)
     """
-    try:
-        import garth
-        print("Seeding tokens via garth.login(...)")
-        # garth >= 0.6.x supports a simple login(email, password)
-        garth.login(email, password)
-        garth.save(str(TOKEN_DIR))
-    except AttributeError:
-        # Older garth might expose a different API; fail gracefully
-        print("garth.login not available on this version.")
-        return False
-    except Exception as e:
-        print(f"garth.login/save failed: {e}")
-        return False
 
-    # Verify non-empty JSON now exists
-    ok = tokens_present_and_valid()
-    if ok:
-        print("Token seed: OK (garth wrote valid JSON).")
-    else:
-        print("Token seed: FAILED (files still empty/invalid).")
-    return ok
+    
+    if in_cooldown():
+        print("In Garmin cooldown window — skipping login attempt.")
+        return None
 
-# ----------------- Login flow -------------------------
-def login_token_first_then_seed_if_needed():
-    client = Garmin(EMAIL, PASSWORD)
+    client = Garmin(email, password)
 
-    # 1) Token login first (fast path)
-    if tokens_present_and_valid():
+    oauth1_path = TOKEN_DIR / "oauth1_token.json"
+
+    # 1) If token file exists, try tokenstore login
+    if oauth1_path.exists():
         try:
             client.login(tokenstore=str(TOKEN_DIR))
-            print("Token login: OK")
+            print("Login OK (tokenstore).")
             return client
         except Exception as e:
-            print(f"Token login failed ({e}); will try password + seed.")
+            msg = str(e)
+            if "429" in msg or "Too Many Requests" in msg:
+                print(f"Rate-limited by Garmin (429). Will try next scheduled run. Details: {e}")
+                
+                mark_429()
+                print("Rate limited (429). Entering cooldown.")
+                return None
 
-    # 2) Password login (so the run succeeds regardless)
+            if "401" in msg or "Unauthorized" in msg:
+                print(f"Token login failed with 401. Clearing tokenstore and retrying once. Details: {e}")
+                _clear_token_dir()
+                try:
+                    client.login()  # password login
+                    print("Password login OK after token clear.")
+                    # Save tokens for next run
+                    client.garth.save(str(TOKEN_DIR))
+                    print("Saved tokens to tokenstore.")
+                    return client
+                except Exception as e2:
+                    print(f"Login still failed after token clear: {e2}")
+                    traceback.print_exc()
+                    return None
+
+            print(f"Tokenstore login failed: {e}")
+            traceback.print_exc()
+            return None
+
+    # 2) Token file missing -> do password login and then save tokens
     try:
+        print("Token file missing; performing password login to seed tokenstore...")
         client.login()
-        print("Password login: OK")
+        print("Password login OK.")
+        client.garth.save(str(TOKEN_DIR))  # IMPORTANT: create oauth1_token.json
+        print("Saved tokens to tokenstore.")
+        return client
     except Exception as e:
+        msg = str(e)
+        if "429" in msg or "Too Many Requests" in msg:
+            print(f"Rate-limited by Garmin (429). Will try next scheduled run. Details: {e}")
+            return None
         print(f"Password login failed: {e}")
         traceback.print_exc()
         return None
 
-    # 3) Seed tokens via garth (OAuth1) → save → verify
-    seeded = seed_tokens_via_garth(EMAIL, PASSWORD)
-    if not seeded:
-        print("Warning: could not seed tokens; script will rely on password next run.")
-    return client
 
-# ------------------------------ main --------------------------------
+
+
+
+def _extract_weight_rows(client, from_date: date, to_date: date):
+    """
+    Try to fetch weight/body composition history across different garminconnect methods.
+    Returns a list of rows with at least: timestamp/date + weight (kg).
+    """
+    # Preferred (commonly available):
+    # get_body_composition(from, to) returns dict with "dateWeightList"
+    try:
+        data = client.get_body_composition(iso(from_date), iso(to_date))
+        rows = data.get("dateWeightList", []) if isinstance(data, dict) else []
+        print(f"get_body_composition rows: {len(rows)}")
+        if rows:
+            return rows
+    except Exception as e:
+        print(f"get_body_composition failed: {e}")
+
+    # Fallbacks vary by version:
+    if hasattr(client, "get_weight"):
+        try:
+            rows = client.get_weight(iso(from_date), iso(to_date)) or []
+            print(f"get_weight rows: {len(rows)}")
+            if rows:
+                return rows
+        except Exception as e:
+            print(f"get_weight failed: {e}")
+
+    # Very defensive: daily endpoint fallback (slow)
+    if hasattr(client, "get_daily_weight"):
+        try:
+            rows = []
+            d = from_date
+            while d <= to_date:
+                day = client.get_daily_weight(iso(d))
+                # Normalize into a row-like dict if possible
+                if day:
+                    rows.append(day)
+                d += timedelta(days=1)
+            print(f"get_daily_weight rows: {len(rows)}")
+            if rows:
+                return rows
+        except Exception as e:
+            print(f"get_daily_weight failed: {e}")
+
+    return []
+
+
+def _normalize_rows_to_series(rows):
+    """
+    Convert Garmin rows into two parallel arrays:
+      - dates (datetime.date)
+      - weights_kg (float)
+    Handles common shapes seen in dateWeightList.
+    """
+    dates = []
+    weights = []
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+
+        # Common keys in "dateWeightList":
+        # - "date" can be millis, iso string, or yyyymmdd-ish
+        # - "weight" or "weightValue" may appear, sometimes grams
+        dt = None
+
+        # 1) Try epoch millis
+        if "date" in r and isinstance(r["date"], (int, float)):
+            try:
+                dt = datetime.fromtimestamp(r["date"] / 1000, tz=timezone.utc).date()
+            except Exception:
+                dt = None
+
+        # 2) Try ISO-like string
+        if dt is None and "date" in r and isinstance(r["date"], str):
+            s = r["date"].strip()
+            for fmt in ("%Y-%m-%d", "%Y%m%d"):
+                try:
+                    dt = datetime.strptime(s[:10], fmt).date()
+                    break
+                except Exception:
+                    pass
+
+        # 3) Sometimes "calendarDate" or similar
+        if dt is None:
+            for k in ("calendarDate", "dateTimeLocal", "dateTimeUtc"):
+                v = r.get(k)
+                if isinstance(v, str) and len(v) >= 10:
+                    try:
+                        dt = datetime.strptime(v[:10], "%Y-%m-%d").date()
+                        break
+                    except Exception:
+                        continue
+
+        # Weight extraction
+        w = None
+        for k in ("weight", "weightValue", "weightInGrams", "weightInKg"):
+            if k in r and isinstance(r[k], (int, float)):
+                w = float(r[k])
+                # Heuristics: if grams, convert to kg
+                if k == "weightInGrams" or w > 250:  # 80kg would be 80000 grams; 80000 > 250
+                    # If values look like grams (e.g., 80000), convert
+                    if w > 1000:
+                        w = w / 1000.0
+                break
+
+        # Sometimes stored in nested structures
+        if w is None:
+            v = r.get("weight")
+            if isinstance(v, dict) and "value" in v:
+                try:
+                    w = float(v["value"])
+                except Exception:
+                    w = None
+
+        if dt is not None and w is not None:
+            dates.append(dt)
+            weights.append(w)
+
+    # Sort by date
+    if dates and weights:
+        pairs = sorted(zip(dates, weights), key=lambda x: x[0])
+        dates, weights = zip(*pairs)
+        return list(dates), list(weights)
+
+    return [], []
+
+
+def _save_plot(dates, weights):
+    if not dates or not weights:
+        print("No data to plot.")
+        return
+
+    # Convert date objects to datetimes for matplotlib
+    x = [datetime(d.year, d.month, d.day) for d in dates]
+    y = weights
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(x, y, marker="o", linewidth=1.5)
+    ax.set_title("Weight (kg)")
+    ax.set_ylabel("kg")
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d"))
+    fig.autofmt_xdate()
+
+    out = OUTPUT_DIR / "weight_timeseries.jpg"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved plot: {out}")
+
+
+def _save_csv(dates, weights):
+    if not dates or not weights:
+        return
+
+    out = OUTPUT_DIR / "weight_timeseries.csv"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("date,weight_kg\n")
+        for d, w in zip(dates, weights):
+            f.write(f"{d.isoformat()},{w:.2f}\n")
+    print(f"Saved CSV: {out}")
+
+
 def main():
-    client = login_token_first_then_seed_if_needed()
+    # Require env vars (safer than defaults)
+    email = "eaajohannessen@gmail.com"  #os.environ.get("GARMIN_EMAIL")
+    password = "Erlinga_22"             #os.environ.get("GARMIN_PASSWORD")
+    if not email or not password:
+        print("ERROR: GARMIN_EMAIL and GARMIN_PASSWORD must be set in the environment.")
+        return 2
+
+    client = login_tokenstore_or_password_seed(email, password)
     if client is None:
         return 1
 
-    # ---------------------- Date range -------------------------------
+    # Date range (4 years like your original intent) [1](https://masterx-my.sharepoint.com/personal/erling_johannessen_km_kongsberg_com/Documents/Microsoft%20Copilot%20Chat%20Files/run_weight.py)
     to_date = date.today()
-    from_date = to_date - timedelta(days=4 * 365)  # 4 years
+    from_date = to_date - timedelta(days=4 * 365)
     print(f"Date range: {from_date} .. {to_date}")
 
-    # ---------------------- Retrieve weight rows ---------------------
-    weight_rows = []
-    try:
-        rows = client.get_body_composition(iso(from_date), iso(to_date))
-        weight_rows = rows.get("dateWeightList", [])
-        print(f"get_body_composition rows: {len(weight_rows)}")
-    except AttributeError:
-        if hasattr(client, "get_weight"):
-            weight_rows = client.get_weight(iso(from_date), iso(to_date)) or []
-            print(f"get_weight rows: {len(weight_rows)}")
-        elif hasattr(client, "get_daily_weight"):
-            d = to_date
-            print("Falling back to get_daily_weight per-day loop...")
-            while d >= from_date:
-                day_data = client.get_daily_weight(iso(d))
-                if day_data:
-                    if isinstance(day_data, list):
-                        weight_rows.extend(day_data)
-                    else:
-                        weight_rows.append(day_data)
-                d -= timedelta(days=1)
-            print(f"get_daily_weight rows: {len(weight_rows)}")
-        else:
-            print("No weight API available in this garminconnect version.")
-            weight_rows = []
+    # Retrieve rows
+    rows = _extract_weight_rows(client, from_date, to_date)
+    print(f"Total raw rows: {len(rows)}")
 
-    # ---------------------- Normalize & parse dates ------------------
-    from datetime import datetime as dtclass
+    # Normalize to series
+    dates, weights = _normalize_rows_to_series(rows)
+    print(f"Normalized points: {len(dates)}")
 
-    def parse_any_date(s: str):
-        if not s:
-            return None
-        try:
-            return dtclass.fromisoformat(s)
-        except Exception:
-            pass
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
-            try:
-                return dtclass.strptime(s, fmt)
-            except Exception:
-                continue
-        return None
+    # Save outputs
+    _save_csv(dates, weights)
+    _save_plot(dates, weights)
 
-    def extract_weight_kg(rec: dict):
-        w = rec.get("weight")
-        if w is None:
-            w = rec.get("weightInKilograms") or rec.get("weightInKg")
-        if w is None:
-            return None
-        if isinstance(w, (int, float)) and w > 250:
-            return float(w) / 1000.0
-        return float(w)
-
-    by_date = {}
-    for r in weight_rows:
-        ts = r.get("calendarDate") or r.get("date") or r.get("measurementTime")
-        dt = parse_any_date(ts)
-        if not dt:
-            continue
-        day = dt.date()
-        w_kg = extract_weight_kg(r)
-        if w_kg is None:
-            continue
-        by_date[day] = w_kg
-
-    meas_dates = sorted(by_date.keys())
-    meas_weights = [by_date[d] for d in meas_dates]
-
-    if not meas_dates:
-        print("No weight records found in the selected range.")
-        print("=== Run finished (no data) ===")
-        return 0
-
-    # ---------------------- Console summary --------------------------
-    print("\nSamples (date → weight, days since previous):")
-    prev_date = None
-    for d in meas_dates:
-        w = by_date[d]
-        delta_days = 0 if prev_date is None else (d - prev_date).days
-        print(f"{d}: {w:5.1f} kg (Δ {delta_days:3d} days)")
-        prev_date = d
-    days_since_last = (to_date - meas_dates[-1]).days
-    print(f"\nDays since last sample: {days_since_last:3d} days\n")
-
-    # ---------------------- Daily linear interpolation ----------------
-    def build_daily_linear_interp(dates_list, weights_list):
-        start = dates_list[0]
-        end = dates_list[-1]
-        total_days = (end - start).days
-        daily_dates = [start + timedelta(days=i) for i in range(total_days + 1)]
-        daily_weights = [None] * (total_days + 1)
-        known_idx = {}
-        for d, w in zip(dates_list, weights_list):
-            idx = (d - start).days
-            known_idx[idx] = w
-            daily_weights[idx] = w
-        idxs = sorted(known_idx.keys())
-        for a, b in zip(idxs[:-1], idxs[1:]):
-            wa, wb = daily_weights[a], daily_weights[b]
-            span = b - a
-            if span <= 0:
-                continue
-            slope = (wb - wa) / span
-            for i in range(span + 1):  # inclusive ends
-                daily_weights[a + i] = wa + slope * i
-        return daily_dates, daily_weights
-
-    daily_dates, daily_weights = build_daily_linear_interp(meas_dates, meas_weights)
-
-    # ---------------------- Centered change per week ------------------
-    def centered_change_per_week(weights, prev_len, next_len):
-        change = [None] * len(weights)
-        delta_days = (prev_len + next_len + 2) / 2.0
-        scale = 7.0 / delta_days
-        for i in range(len(weights)):
-            if i >= prev_len and i + next_len < len(weights):
-                prev = weights[i - prev_len:i]
-                foll = weights[i + 1:i + 1 + next_len]
-                if all(v is not None for v in prev + foll):
-                    diff = (sum(foll) / next_len) - (sum(prev) / prev_len)
-                    change[i] = diff * scale
-        return change
-
-    change_30d_per_week = centered_change_per_week(daily_weights, prev_len=15, next_len=15)
-    change_week_per_week = centered_change_per_week(daily_weights, prev_len=4, next_len=3)
-
-    # ---------------------- Subset: last 3 months ---------------------
-    cutoff = to_date - timedelta(days=90)
-
-    def first_ge(seq, target):
-        for idx, d in enumerate(seq):
-            if d >= target:
-                return idx
-        return len(seq)
-
-    start_3m_idx = first_ge(daily_dates, cutoff)
-    dates_3m = daily_dates[start_3m_idx:]
-    weights_3m = daily_weights[start_3m_idx:]
-    change_week_3m_per_week = change_week_per_week[start_3m_idx:]
-
-    meas_dates_3m = [d for d in meas_dates if d >= cutoff]
-    meas_weights_3m = [by_date[d] for d in meas_dates_3m]
-
-    # ---------------------- Plot 1: Full range ------------------------
-    fig1, ax1 = plt.subplots(figsize=(11, 5.5))
-    ax1.plot(daily_dates, daily_weights, linewidth=1.6, color="#1f77b4",
-             label="Weight (kg) — interpolated daily")
-    ax1.set_title("Weight over time (kg)")
-    ax1.set_xlabel("Date")
-    ax1.set_ylabel("Weight (kg)")
-    ax1.grid(True, linestyle="--", alpha=0.35)
-    ax1.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d"))
-    plt.setp(ax1.get_xticklabels(), rotation=45, ha="right")
-    ax1.yaxis.set_major_formatter(lambda x, pos: f"{x:.1f}")
-
-    ax1b = ax1.twinx()
-    x_full = [d for d, c in zip(daily_dates, change_30d_per_week) if c is not None]
-    y_full = [c for c in change_30d_per_week if c is not None]
-    ax1b.plot(x_full, y_full, color="#ff7f0e", linewidth=2.0,
-              label="Centered 30-day change (kg/week)")
-    ax1b.axhline(0.0, color="gray", linewidth=1.0, linestyle=":")
-    ax1b.set_ylabel("Centered 30-day change (kg/week)")
-    ax1b.yaxis.set_major_formatter(lambda x, pos: f"{x:.2f}")
-
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax1b.get_legend_handles_labels()
-    ax1.legend(lines + lines2, labels + labels2, loc="upper left")
-    fig1.tight_layout()
-
-    out1 = OUTPUT_DIR / "garmin_weight_full_centered_30day_change_per_week.jpg"
-    fig1.savefig(out1, dpi=150, format="jpg",
-                 pil_kwargs={"quality": 95, "optimize": True})
-    plt.close(fig1)
-    print(f"Saved: {out1}")
-
-    # ---------------------- Plot 2: Last 3 months ---------------------
-    fig2, ax2 = plt.subplots(figsize=(11, 5.5))
-    ax2.plot(dates_3m, weights_3m, linewidth=1.6, color="#1f77b4",
-             label="Weight (kg) — interpolated daily")
-    if meas_dates_3m:
-        ax2.plot(
-            meas_dates_3m, meas_weights_3m,
-            linestyle="None", marker="o", markersize=6,
-            markerfacecolor="#1f77b4", markeredgecolor="white", markeredgewidth=1.0,
-            label="Samples", zorder=4
-        )
-    ax2.set_title("Weight (last 3 months)")
-    ax2.set_xlabel("Date")
-    ax2.set_ylabel("Weight (kg)")
-    ax2.grid(True, linestyle="--", alpha=0.35)
-    ax2.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d"))
-    plt.setp(ax2.get_xticklabels(), rotation=45, ha="right")
-    ax2.yaxis.set_major_formatter(lambda x, pos: f"{x:.1f}")
-
-    ax2b = ax2.twinx()
-    x_3m = [d for d, c in zip(dates_3m, change_week_3m_per_week) if c is not None]
-    y_3m = [c for c in change_week_3m_per_week if c is not None]
-    ax2b.plot(x_3m, y_3m, color="#ff7f0e", linewidth=2.0,
-              label="Centered weekly change (kg/week)")
-    ax2b.axhline(0.0, color="gray", linewidth=1.0, linestyle=":")
-    ax2b.set_ylabel("Centered weekly change (kg/week)")
-    ax2b.yaxis.set_major_formatter(lambda x, pos: f"{x:.2f}")
-
-    lines, labels = ax2.get_legend_handles_labels()
-    lines2, labels2 = ax2b.get_legend_handles_labels()
-    ax2.legend(lines + lines2, labels + labels2, loc="upper left")
-    fig2.tight_layout()
-
-    out2 = OUTPUT_DIR / "garmin_weight_3mo_centered_weekly_change_per_week_samples.jpg"
-    fig2.savefig(out2, dpi=150, format="jpg",
-                 pil_kwargs={"quality": 95, "optimize": True})
-    plt.close(fig2)
-    print(f"Saved: {out2}")
-
-    print("=== Run finished OK ===")
+    print("Done.")
     return 0
+
 
 if __name__ == "__main__":
     exit_code = 0
